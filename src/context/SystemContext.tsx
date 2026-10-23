@@ -6,8 +6,14 @@ import {
   RoadHealthMetrics,
   SimulationSequenceState,
   PotholeStatus,
+  HardwareConnectionStatus,
+  HardwareConnectionType,
+  OperatingMode,
+  AnalysisState,
+  TelemetrySource,
 } from '../types';
 import { ISensorService } from '../services/SensorService';
+import { Esp32SensorService } from '../services/Esp32SensorService';
 import { SimulatedSensorService } from '../services/SimulatedSensorService';
 import { DetectionEngine } from '../services/DetectionEngine';
 import { StorageService } from '../services/StorageService';
@@ -32,108 +38,152 @@ export interface ToastMessage {
 }
 
 interface SystemContextType {
-  currentReading: SensorReading;
-  telemetryHistory: SensorReading[];
-  detectionResult: DetectionResult;
-  potholeEvents: PotholeEvent[];
-  roadHealth: RoadHealthMetrics;
-  sequenceState: SimulationSequenceState;
+  // Operating & Analysis States
+  operatingMode: OperatingMode;
+  analysisState: AnalysisState;
+  isAnalyzing: boolean;
   isStreamRunning: boolean;
   isDemoMode: boolean;
+
+  // Telemetry
+  currentReading: SensorReading | null;
+  telemetryHistory: SensorReading[];
+  telemetrySource: TelemetrySource | 'NONE';
+  detectionResult: DetectionResult;
+  roadHealth: RoadHealthMetrics;
+  sequenceState: SimulationSequenceState;
+  ingestedPacketsCount: number;
+
+  // Detections & Data Separation
+  potholeEvents: PotholeEvent[]; // active events according to current mode
+  verifiedEvents: PotholeEvent[]; // genuine hardware records
+  demoEvents: PotholeEvent[]; // current demo session records
+  lastDetectedEvent: PotholeEvent | null;
+  quarantineNotice: string | null;
+
+  // Hardware Status
+  hardwareStatus: HardwareConnectionStatus;
+  hardwareConnectionType: HardwareConnectionType | null;
+  hardwareEndpoint: string;
+  hardwareError: string | null;
+  sensorService: ISensorService;
   buzzerEnabled: boolean;
+
+  // Global UI
   activeTab: NavigationTab;
   toasts: ToastMessage[];
-  lastDetectedEvent: PotholeEvent | null;
-  sensorService: ISensorService;
-  
-  // Actions
+  isConnectModalOpen: boolean;
+
+  // Mode & Hardware Actions
   setActiveTab: (tab: NavigationTab) => void;
+  setIsConnectModalOpen: (open: boolean) => void;
+  selectOperatingMode: (mode: OperatingMode) => void;
+  launchSimulationDemo: () => void;
+  exitSimulationDemo: () => void;
+  connectHardware: (type?: HardwareConnectionType, endpoint?: string) => Promise<boolean>;
+  disconnectHardware: () => void;
+  setHardwareEndpoint: (endpoint: string) => void;
+
+  // Analysis Controls
+  startAnalysis: () => void;
+  stopAnalysis: () => void;
+  toggleAnalysis: () => void;
+
+  // Data & Storage Actions
+  updateEventStatus: (eventId: string, newStatus: PotholeStatus, notes?: string) => void;
+  deleteEvent: (eventId: string) => void;
+  clearAllEvents: () => void;
+  clearDemoSession: () => void;
+  clearVerifiedEvents: () => void;
+  dismissQuarantineNotice: () => void;
+  toggleBuzzer: () => void;
+  dismissToast: (id: string) => void;
+
+  // Simulation controls
+  triggerScenario: (scenario: 'normal' | 'rough' | 'small' | 'medium' | 'severe') => void;
   startSimulation: () => void;
   pauseSimulation: () => void;
   resetSimulation: () => void;
-  triggerScenario: (scenario: 'normal' | 'rough' | 'small' | 'medium' | 'severe') => void;
   startDemoMode: () => void;
   stopDemoMode: () => void;
-  updateEventStatus: (eventId: string, newStatus: PotholeStatus, notes?: string) => void;
-  deleteEvent: (eventId: string) => void;
-  resetToSeedEvents: () => void;
-  toggleBuzzer: () => void;
-  dismissToast: (id: string) => void;
 }
 
 const SystemContext = createContext<SystemContextType | undefined>(undefined);
 
-// Web Audio API Piezo Buzzer Sound Generator
-const playBuzzerAlert = (frequency = 2400, duration = 0.12, repetitions = 2) => {
-  try {
-    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-    if (!AudioContextClass) return;
-    const ctx = new AudioContextClass();
-
-    for (let i = 0; i < repetitions; i++) {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = 'square'; // Harsh square wave like hardware piezo buzzer
-      osc.frequency.setValueAtTime(frequency, ctx.currentTime + i * 0.18);
-      
-      gain.gain.setValueAtTime(0.15, ctx.currentTime + i * 0.18);
-      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + i * 0.18 + duration);
-
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-
-      osc.start(ctx.currentTime + i * 0.18);
-      osc.stop(ctx.currentTime + i * 0.18 + duration);
-    }
-  } catch {
-    // Audio might be muted by browser policy before user interaction
-  }
-};
-
 export const SystemProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   // Service instances
-  const sensorServiceRef = useRef<ISensorService>(new SimulatedSensorService());
+  const esp32ServiceRef = useRef<Esp32SensorService>(new Esp32SensorService());
+  const simulatedServiceRef = useRef<SimulatedSensorService>(new SimulatedSensorService());
   const detectionEngineRef = useRef<DetectionEngine>(new DetectionEngine());
 
-  // State
-  const [currentReading, setCurrentReading] = useState<SensorReading>(() =>
-    sensorServiceRef.current.getCurrentReading()
-  );
+  // Operating Mode & Analysis State
+  const [operatingMode, setOperatingMode] = useState<OperatingMode>('STANDBY');
+  const [analysisState, setAnalysisState] = useState<AnalysisState>('IDLE');
+  const isAnalyzing = analysisState === 'RUNNING';
+
+  // Hardware Connection State
+  const [hardwareStatus, setHardwareStatus] = useState<HardwareConnectionStatus>('DISCONNECTED');
+  const [hardwareConnectionType, setHardwareConnectionType] = useState<HardwareConnectionType | null>(null);
+  const [hardwareEndpoint, setHardwareEndpoint] = useState<string>('ws://192.168.4.1:81');
+  const [hardwareError, setHardwareError] = useState<string | null>(null);
+  const [ingestedPacketsCount, setIngestedPacketsCount] = useState<number>(0);
+
+  // Telemetry State
+  const [currentReading, setCurrentReading] = useState<SensorReading | null>(null);
   const [telemetryHistory, setTelemetryHistory] = useState<SensorReading[]>([]);
   const [detectionResult, setDetectionResult] = useState<DetectionResult>({
-    condition: 'NORMAL',
-    confidence: 0,
+    condition: 'STANDBY',
+    confidence: null,
     severity: null,
-    reasons: ['System standing by on baseline road surface'],
-    distanceAnomalyContribution: 0,
-    accelAnomalyContribution: 0,
-    vibrationContribution: 0,
+    reasons: ['System standing by: Select "Connect Hardware" or "Launch Simulation Demo" to begin.'],
+    distanceAnomalyContribution: null,
+    accelAnomalyContribution: null,
+    vibrationContribution: null,
     isPotholeConfirmed: false,
   });
 
-  const [potholeEvents, setPotholeEvents] = useState<PotholeEvent[]>(() =>
-    StorageService.loadEvents()
+  // Separate Event Lists
+  const [verifiedEvents, setVerifiedEvents] = useState<PotholeEvent[]>(() =>
+    StorageService.loadVerifiedEvents()
   );
-  const [roadHealth, setRoadHealth] = useState<RoadHealthMetrics>(() =>
-    RoadHealthEngine.calculateMetrics(StorageService.loadEvents())
+  const [demoEvents, setDemoEvents] = useState<PotholeEvent[]>(() =>
+    StorageService.loadDemoEvents()
   );
+  const [lastDetectedEvent, setLastDetectedEvent] = useState<PotholeEvent | null>(null);
+
+  // Quarantine Notice
+  const [quarantineNotice, setQuarantineNotice] = useState<string | null>(() =>
+    StorageService.getQuarantineNotice()
+  );
+
+  // Simulation Sequence State
   const [sequenceState, setSequenceState] = useState<SimulationSequenceState>({
     sequenceName: null,
     phase: 0,
-    phaseTitle: 'Idle Normal Stream',
-    phaseDescription: 'Vehicle cruising smoothly on inspected route.',
-    totalPhases: 8,
+    phaseTitle: 'Standby',
+    phaseDescription: 'Select operating mode to begin.',
+    totalPhases: 0,
     isActive: false,
   });
 
-  const [isStreamRunning, setIsStreamRunning] = useState<boolean>(false);
-  const [isDemoMode, setIsDemoMode] = useState<boolean>(false);
-  const [buzzerEnabled, setBuzzerEnabled] = useState<boolean>(true);
+  // Global UI State
+  const [buzzerEnabled, setBuzzerEnabled] = useState<boolean>(false);
   const [activeTab, setActiveTab] = useState<NavigationTab>('dashboard');
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
-  const [lastDetectedEvent, setLastDetectedEvent] = useState<PotholeEvent | null>(null);
+  const [isConnectModalOpen, setIsConnectModalOpen] = useState<boolean>(false);
 
-  const demoTimeoutsRef = useRef<number[]>([]);
+  // Active Pothole Events view based on operating mode
+  const activeEvents = operatingMode === 'SIMULATION' ? demoEvents : verifiedEvents;
+
+  // Road health dynamically calculated based on active events
+  const [roadHealth, setRoadHealth] = useState<RoadHealthMetrics>(() =>
+    RoadHealthEngine.calculateMetrics(StorageService.loadVerifiedEvents())
+  );
+
+  useEffect(() => {
+    const metrics = RoadHealthEngine.calculateMetrics(activeEvents);
+    setRoadHealth(metrics);
+  }, [activeEvents, operatingMode]);
 
   // Toast dispatcher
   const addToast = useCallback(
@@ -146,7 +196,6 @@ export const SystemProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         timestamp: new Date().toLocaleTimeString(),
       };
       setToasts((prev) => [newToast, ...prev.slice(0, 4)]);
-      // Auto dismiss after 4 seconds
       setTimeout(() => {
         setToasts((prev) => prev.filter((t) => t.id !== newToast.id));
       }, 4500);
@@ -158,19 +207,41 @@ export const SystemProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setToasts((prev) => prev.filter((t) => t.id !== id));
   };
 
-  // Recalculate road health when potholeEvents change
-  useEffect(() => {
-    const metrics = RoadHealthEngine.calculateMetrics(potholeEvents);
-    setRoadHealth(metrics);
-  }, [potholeEvents]);
+  const dismissQuarantineNotice = () => {
+    StorageService.dismissQuarantineNotice();
+    setQuarantineNotice(null);
+  };
 
-  // Hook sensor stream
+  // 1. ESP32 Status Listener
   useEffect(() => {
-    const sensor = sensorServiceRef.current;
-    const engine = detectionEngineRef.current;
+    const unsubscribeStatus = esp32ServiceRef.current.subscribeStatus((status, errorMsg) => {
+      setHardwareStatus(status);
+      setHardwareConnectionType(esp32ServiceRef.current.getConnectionType());
+      if (errorMsg) {
+        setHardwareError(errorMsg);
+      } else if (status === 'CONNECTED' || status === 'AWAITING_TELEMETRY') {
+        setHardwareError(null);
+      }
+      if (status === 'CONNECTION_LOST') {
+        addToast('danger', 'Connection Lost', errorMsg || 'ESP32 serial connection lost. Please reconnect.');
+      }
+    });
 
-    const unsubscribeData = sensor.subscribe((reading) => {
+    return () => {
+      unsubscribeStatus();
+    };
+  }, [addToast]);
+
+  // Shared frame processor
+  const handleIncomingReading = useCallback(
+    (reading: SensorReading) => {
+      setIngestedPacketsCount((prev) => prev + 1);
       setCurrentReading(reading);
+
+      // Only perform detection engine evaluation if analysis is running
+      if (analysisState !== 'RUNNING') {
+        return;
+      }
 
       // Add to rolling history (keep latest 35 entries for charts)
       setTelemetryHistory((prev) => {
@@ -179,32 +250,58 @@ export const SystemProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         return next;
       });
 
-      // Run detection engine sensor fusion evaluation
-      const { result, newEvent } = engine.evaluate(reading);
+      // Run multi-sensor fusion evaluation
+      const { result, newEvent } = detectionEngineRef.current.evaluate(reading);
       setDetectionResult(result);
 
       if (newEvent) {
         setLastDetectedEvent(newEvent);
-        // Persist to local storage
-        const updated = StorageService.addEvent(newEvent);
-        setPotholeEvents(updated);
 
-        // Play hardware buzzer sound
-        if (buzzerEnabled) {
-          playBuzzerAlert(
-            newEvent.severity === 'HIGH' ? 2800 : newEvent.severity === 'MEDIUM' ? 2200 : 1800,
-            0.15,
-            newEvent.severity === 'HIGH' ? 3 : 2
+        if (reading.source === 'SIMULATION') {
+          // Persist to separate demo session storage
+          const updated = StorageService.addDemoEvent(newEvent);
+          setDemoEvents(updated);
+          addToast(
+            'warning',
+            `Simulated Pothole Candidate (${newEvent.severity})`,
+            `Synthetic anomaly detected on ${newEvent.roadSegmentName || 'Demo Corridor'} | Depth: ${newEvent.estimatedDepth}`
+          );
+        } else {
+          // Persist to verified hardware storage
+          const updated = StorageService.addVerifiedEvent(newEvent);
+          setVerifiedEvents(updated);
+          addToast(
+            newEvent.severity === 'HIGH' ? 'danger' : 'warning',
+            `Hardware Pothole Detected (${newEvent.severity})`,
+            `ESP32 Reading #${reading.readingNumber ?? ''}: Distance ${reading.ultrasonicDistance.toFixed(1)} cm | Vibration ${reading.vibrationG ?? reading.vibration} g`
           );
         }
-
-        // Trigger toast
-        addToast(
-          newEvent.severity === 'HIGH' ? 'danger' : newEvent.severity === 'MEDIUM' ? 'warning' : 'info',
-          `Pothole Detected: ${newEvent.severity} Severity`,
-          `${newEvent.roadSegmentName} | Est. Depth: ${newEvent.estimatedDepth} | Conf: ${newEvent.confidence}%`
-        );
       }
+    },
+    [analysisState, addToast]
+  );
+
+  // 2. Hardware stream subscription
+  useEffect(() => {
+    if (operatingMode !== 'HARDWARE') return;
+
+    const sensor = esp32ServiceRef.current;
+    const unsubscribeData = sensor.subscribe((reading) => {
+      handleIncomingReading(reading);
+    });
+
+    return () => {
+      unsubscribeData();
+    };
+  }, [operatingMode, handleIncomingReading]);
+
+  // 3. Simulation stream subscription
+  useEffect(() => {
+    if (operatingMode !== 'SIMULATION') return;
+
+    const sensor = simulatedServiceRef.current;
+    const unsubscribeData = sensor.subscribe((reading) => {
+      handleIncomingReading(reading);
     });
 
     const unsubscribeSeq = sensor.subscribeSequence((seq) => {
@@ -215,163 +312,323 @@ export const SystemProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       unsubscribeData();
       unsubscribeSeq();
     };
-  }, [buzzerEnabled, addToast]);
+  }, [operatingMode, handleIncomingReading]);
 
-  // Automatically start sensor stream on initial mount
-  useEffect(() => {
-    sensorServiceRef.current.start();
-    setIsStreamRunning(true);
-    addToast(
-      'info',
-      'Simulation Stream Initialized',
-      'Sensor data is currently simulated. ESP32 hardware bridge is ready.'
-    );
-  }, [addToast]);
+  // Launch Simulation Demo Mode
+  const launchSimulationDemo = useCallback(() => {
+    // If hardware was connected, suspend hardware stream
+    if (esp32ServiceRef.current.isHardwareConnected()) {
+      esp32ServiceRef.current.disconnect();
+    }
 
-  const startSimulation = () => {
-    sensorServiceRef.current.start();
-    setIsStreamRunning(true);
-  };
-
-  const pauseSimulation = () => {
-    sensorServiceRef.current.pause();
-    setIsStreamRunning(false);
-  };
-
-  const resetSimulation = () => {
-    sensorServiceRef.current.reset();
+    setOperatingMode('SIMULATION');
+    setAnalysisState('RUNNING');
     detectionEngineRef.current.reset();
-    setIsStreamRunning(false);
     setTelemetryHistory([]);
+
+    simulatedServiceRef.current.reset();
+    simulatedServiceRef.current.start();
+
     setDetectionResult({
       condition: 'NORMAL',
       confidence: 0,
       severity: null,
-      reasons: ['System reset to origin'],
+      reasons: ['Simulation Demo Active: Evaluating synthetic telemetry stream along demonstration route.'],
       distanceAnomalyContribution: 0,
       accelAnomalyContribution: 0,
       vibrationContribution: 0,
       isPotholeConfirmed: false,
     });
-    addToast('info', 'Simulation Reset', 'Vehicle returned to starting coordinates.');
+
+    addToast(
+      'info',
+      'Simulation Demo Active',
+      'Running synthetic sensor telemetry along demo route. Real ESP32 is not required.'
+    );
+  }, [addToast]);
+
+  // Exit Simulation Demo Mode
+  const exitSimulationDemo = useCallback(() => {
+    simulatedServiceRef.current.reset();
+    setOperatingMode('STANDBY');
+    setAnalysisState('IDLE');
+    setCurrentReading(null);
+    setTelemetryHistory([]);
+    detectionEngineRef.current.reset();
+
+    setDetectionResult({
+      condition: 'STANDBY',
+      confidence: null,
+      severity: null,
+      reasons: ['System in Standby. Select "Connect Hardware" or "Launch Simulation Demo" to begin.'],
+      distanceAnomalyContribution: null,
+      accelAnomalyContribution: null,
+      vibrationContribution: null,
+      isPotholeConfirmed: false,
+    });
+
+    addToast('info', 'Demo Stopped', 'Exited Simulation Demo. System returned to standby.');
+  }, [addToast]);
+
+  // Select Operating Mode explicitly
+  const selectOperatingMode = useCallback(
+    (mode: OperatingMode) => {
+      if (mode === 'SIMULATION') {
+        launchSimulationDemo();
+      } else if (mode === 'HARDWARE') {
+        simulatedServiceRef.current.reset();
+        setOperatingMode('HARDWARE');
+        setAnalysisState('IDLE');
+        setCurrentReading(null);
+        setTelemetryHistory([]);
+        detectionEngineRef.current.reset();
+        addToast('info', 'Hardware Mode Selected', 'Please connect your ESP32 MCU via WebSocket or USB Serial.');
+      } else {
+        exitSimulationDemo();
+      }
+    },
+    [launchSimulationDemo, exitSimulationDemo, addToast]
+  );
+
+  // Connect to Physical ESP32 Hardware
+  const connectHardware = async (
+    type: HardwareConnectionType = 'WEBSOCKET',
+    endpoint?: string
+  ): Promise<boolean> => {
+    // If simulation was running, stop it first
+    if (operatingMode === 'SIMULATION') {
+      simulatedServiceRef.current.reset();
+    }
+
+    setOperatingMode('HARDWARE');
+    const targetEndpoint = endpoint || hardwareEndpoint;
+    setHardwareError(null);
+
+    if (type === 'SERIAL') {
+      addToast('info', 'Connecting Hardware', 'Opening Web Serial port selector for ESP32 (115200 baud)...');
+      const success = await esp32ServiceRef.current.connectSerial();
+      if (success) {
+        setAnalysisState('RUNNING');
+        addToast('info', 'Port Opened', 'ESP32 COM port opened. Waiting for valid telemetry lines...');
+      } else {
+        addToast('danger', 'Connection Failed', 'Could not open serial connection to ESP32.');
+      }
+      return success;
+    } else {
+      addToast('info', 'Connecting Hardware', `Attempting WebSocket connection to ${targetEndpoint}...`);
+      const success = await esp32ServiceRef.current.connectWebSocket(targetEndpoint);
+      if (success) {
+        setAnalysisState('RUNNING');
+        addToast('success', 'Hardware Connected', `ESP32 connected via WebSocket at ${targetEndpoint}.`);
+      } else {
+        addToast('danger', 'Connection Failed', `Could not connect to ${targetEndpoint}. Ensure ESP32 is powered on.`);
+      }
+      return success;
+    }
   };
 
-  const triggerScenario = (scenario: 'normal' | 'rough' | 'small' | 'medium' | 'severe') => {
-    sensorServiceRef.current.triggerScenario(scenario);
-    setIsStreamRunning(true);
+  const disconnectHardware = async () => {
+    await esp32ServiceRef.current.disconnect();
+    setHardwareStatus('DISCONNECTED');
+    setHardwareConnectionType(null);
+    setAnalysisState('IDLE');
+    addToast('info', 'Hardware Disconnected', 'ESP32 sensor bridge disconnected.');
   };
 
-  const clearDemoTimeouts = () => {
-    demoTimeoutsRef.current.forEach((t) => clearTimeout(t));
-    demoTimeoutsRef.current = [];
+  // Start / Resume Analysis
+  const startAnalysis = () => {
+    if (operatingMode === 'STANDBY') {
+      setIsConnectModalOpen(true);
+      addToast('info', 'Select Operating Mode', 'Choose Hardware Mode or Simulation Demo Mode to begin analysis.');
+      return;
+    }
+
+    if (operatingMode === 'HARDWARE' && hardwareStatus === 'DISCONNECTED') {
+      setIsConnectModalOpen(true);
+      addToast('warning', 'Hardware Disconnected', 'Connect physical ESP32 via USB Serial or WebSocket to begin analysis.');
+      return;
+    }
+
+    setAnalysisState('RUNNING');
+
+    if (operatingMode === 'SIMULATION') {
+      simulatedServiceRef.current.start();
+      addToast('success', 'Analysis Active', 'Evaluating synthetic telemetry stream along demo route.');
+    } else {
+      addToast('success', 'Analysis Active', 'Real-time sensor fusion is actively evaluating ESP32 telemetry.');
+    }
+
+    setDetectionResult({
+      condition: 'NORMAL',
+      confidence: 0,
+      severity: null,
+      reasons: ['Analysis Engine Active: Monitoring incoming telemetry frames.'],
+      distanceAnomalyContribution: 0,
+      accelAnomalyContribution: 0,
+      vibrationContribution: 0,
+      isPotholeConfirmed: false,
+    });
   };
 
-  const startDemoMode = () => {
-    clearDemoTimeouts();
-    setIsDemoMode(true);
-    sensorServiceRef.current.start();
-    setIsStreamRunning(true);
+  // Pause / Stop Analysis
+  const stopAnalysis = () => {
+    setAnalysisState('PAUSED');
 
-    addToast('info', 'Demo Mode Activated', 'Starting automated multi-condition demonstration sequence...');
+    if (operatingMode === 'SIMULATION') {
+      simulatedServiceRef.current.pause();
+    }
 
-    // Step 1: Normal Road
-    triggerScenario('normal');
+    setDetectionResult({
+      condition: 'STANDBY',
+      confidence: null,
+      severity: null,
+      reasons: ['Analysis paused. Click "Resume Analysis" to continue monitoring.'],
+      distanceAnomalyContribution: null,
+      accelAnomalyContribution: null,
+      vibrationContribution: null,
+      isPotholeConfirmed: false,
+    });
 
-    // Step 2: Rough Road after 4 seconds
-    const t1 = window.setTimeout(() => {
-      triggerScenario('rough');
-      addToast('info', 'Demo Step 1/3', 'Simulating Rough Road Surface condition...');
-    }, 4500);
-
-    // Step 3: Medium Pothole after 11 seconds
-    const t2 = window.setTimeout(() => {
-      triggerScenario('medium');
-      addToast('warning', 'Demo Step 2/3', 'Approaching and detecting Medium Pothole...');
-    }, 11500);
-
-    // Step 4: Severe Pothole after 19 seconds
-    const t3 = window.setTimeout(() => {
-      triggerScenario('severe');
-      addToast('danger', 'Demo Step 3/3', 'Simulating Severe Pothole Impact event!');
-    }, 19000);
-
-    // End of demo
-    const t4 = window.setTimeout(() => {
-      setIsDemoMode(false);
-      addToast('success', 'Demo Mode Completed', 'Demonstration cycle finished. All data logged and persisted.');
-    }, 28000);
-
-    demoTimeoutsRef.current = [t1, t2, t3, t4];
+    addToast('info', 'Analysis Paused', 'Sensor analysis has been paused.');
   };
 
-  const stopDemoMode = () => {
-    clearDemoTimeouts();
-    setIsDemoMode(false);
-    addToast('info', 'Demo Mode Stopped', 'Automated sequence paused.');
+  const toggleAnalysis = () => {
+    if (isAnalyzing) {
+      stopAnalysis();
+    } else {
+      startAnalysis();
+    }
+  };
+
+  // Clear Demo Session only
+  const clearDemoSession = () => {
+    StorageService.clearDemoEvents();
+    setDemoEvents([]);
+    addToast('info', 'Demo Session Cleared', 'Simulated demo detections have been cleared. Verified hardware records remain intact.');
+  };
+
+  // Clear Verified Hardware Events
+  const clearVerifiedEvents = () => {
+    StorageService.clearVerifiedEvents();
+    setVerifiedEvents([]);
+    addToast('info', 'Verified Storage Cleared', 'Verified hardware detection records have been cleared.');
+  };
+
+  const clearAllEvents = () => {
+    if (operatingMode === 'SIMULATION') {
+      clearDemoSession();
+    } else {
+      clearVerifiedEvents();
+    }
   };
 
   const updateEventStatus = (eventId: string, newStatus: PotholeStatus, notes?: string) => {
-    const updated = StorageService.updateEventStatus(eventId, newStatus, notes);
-    setPotholeEvents(updated);
+    if (operatingMode === 'SIMULATION') {
+      const updated = demoEvents.map((evt) =>
+        evt.id === eventId
+          ? {
+              ...evt,
+              status: newStatus,
+              repairedAt: newStatus === 'REPAIRED' ? new Date().toISOString() : evt.repairedAt,
+              notes: notes ?? evt.notes,
+            }
+          : evt
+      );
+      StorageService.saveDemoEvents(updated);
+      setDemoEvents(updated);
+    } else {
+      const updated = StorageService.updateEventStatus(eventId, newStatus, notes);
+      setVerifiedEvents(updated);
+    }
+
     if (newStatus === 'REPAIRED') {
-      confetti({
-        particleCount: 50,
-        spread: 60,
-        origin: { y: 0.8 },
-      });
-      addToast('success', 'Status Updated: REPAIRED', `Road Health Score recovered.`);
+      confetti({ particleCount: 50, spread: 60, origin: { y: 0.8 } });
+      addToast('success', 'Status Updated: REPAIRED', 'Road Health Score recovered.');
     } else {
       addToast('info', 'Status Updated', `Event marked as ${newStatus}.`);
     }
   };
 
   const deleteEvent = (eventId: string) => {
-    const updated = StorageService.deleteEvent(eventId);
-    setPotholeEvents(updated);
-    addToast('warning', 'Event Deleted', `Pothole record removed from local storage.`);
-  };
-
-  const resetToSeedEvents = () => {
-    const seeded = StorageService.resetToSeed();
-    setPotholeEvents(seeded);
-    addToast('info', 'Database Reset', 'Historical events restored to 9 baseline demo records.');
+    if (operatingMode === 'SIMULATION') {
+      const updated = demoEvents.filter((e) => e.id !== eventId);
+      StorageService.saveDemoEvents(updated);
+      setDemoEvents(updated);
+    } else {
+      const updated = StorageService.deleteEvent(eventId);
+      setVerifiedEvents(updated);
+    }
+    addToast('warning', 'Event Deleted', 'Record removed.');
   };
 
   const toggleBuzzer = () => {
     setBuzzerEnabled((prev) => !prev);
-    if (!buzzerEnabled) {
-      playBuzzerAlert(2000, 0.1, 1);
+    addToast('info', 'Buzzer Subsystem', 'Physical ESP32 piezo buzzer hardware alert integration pending.');
+  };
+
+  // Trigger manual simulation scenario
+  const triggerScenario = (scenario: 'normal' | 'rough' | 'small' | 'medium' | 'severe') => {
+    if (operatingMode !== 'SIMULATION') {
+      addToast('info', 'Enabling Demo Mode', 'Switching to Simulation Demo Mode to run scenario.');
+      launchSimulationDemo();
     }
+    simulatedServiceRef.current.triggerScenario(scenario);
   };
 
   return (
     <SystemContext.Provider
       value={{
+        operatingMode,
+        analysisState,
+        isAnalyzing,
+        isStreamRunning: isAnalyzing,
+        isDemoMode: operatingMode === 'SIMULATION',
         currentReading,
         telemetryHistory,
+        telemetrySource: operatingMode === 'SIMULATION' ? 'SIMULATION' : operatingMode === 'HARDWARE' ? 'HARDWARE' : 'NONE',
         detectionResult,
-        potholeEvents,
         roadHealth,
         sequenceState,
-        isStreamRunning,
-        isDemoMode,
+        ingestedPacketsCount,
+        potholeEvents: activeEvents,
+        verifiedEvents,
+        demoEvents,
+        lastDetectedEvent,
+        quarantineNotice,
+        hardwareStatus,
+        hardwareConnectionType,
+        hardwareEndpoint,
+        hardwareError,
+        sensorService: operatingMode === 'SIMULATION' ? simulatedServiceRef.current : esp32ServiceRef.current,
         buzzerEnabled,
         activeTab,
         toasts,
-        lastDetectedEvent,
-        sensorService: sensorServiceRef.current,
+        isConnectModalOpen,
         setActiveTab,
-        startSimulation,
-        pauseSimulation,
-        resetSimulation,
-        triggerScenario,
-        startDemoMode,
-        stopDemoMode,
+        setIsConnectModalOpen,
+        selectOperatingMode,
+        launchSimulationDemo,
+        exitSimulationDemo,
+        connectHardware,
+        disconnectHardware,
+        setHardwareEndpoint,
+        startAnalysis,
+        stopAnalysis,
+        toggleAnalysis,
         updateEventStatus,
         deleteEvent,
-        resetToSeedEvents,
+        clearAllEvents,
+        clearDemoSession,
+        clearVerifiedEvents,
+        dismissQuarantineNotice,
         toggleBuzzer,
         dismissToast,
+        triggerScenario,
+        startSimulation: launchSimulationDemo,
+        pauseSimulation: stopAnalysis,
+        resetSimulation: exitSimulationDemo,
+        startDemoMode: launchSimulationDemo,
+        stopDemoMode: exitSimulationDemo,
       }}
     >
       {children}

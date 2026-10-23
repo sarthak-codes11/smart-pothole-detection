@@ -7,6 +7,22 @@ export class RoadHealthEngine {
    */
   public static calculateMetrics(events: PotholeEvent[]): RoadHealthMetrics {
     const totalPotholes = events.length;
+    if (totalPotholes === 0) {
+      return {
+        score: null,
+        rating: 'UNAVAILABLE',
+        totalPotholes: 0,
+        highSeverityCount: 0,
+        mediumSeverityCount: 0,
+        lowSeverityCount: 0,
+        eventsTodayCount: 0,
+        mostAffectedSegment: 'No observations recorded',
+        activePotholesCount: 0,
+        repairedCount: 0,
+        isAvailable: false,
+      };
+    }
+
     let highCount = 0;
     let medCount = 0;
     let lowCount = 0;

@@ -60,6 +60,16 @@ export const PotholeDetailModal: React.FC<PotholeDetailModalProps> = ({ event, o
           </button>
         </div>
 
+        {/* Playback Source Notice */}
+        {event.source === 'HARDWARE' && (
+          <div className="my-2 p-2.5 bg-cyan-950/40 border border-cyan-500/30 rounded-lg text-xs text-cyan-300 flex items-center justify-between">
+            <span className="font-mono">
+              Source: <strong>Physical ESP32</strong> (Playback Frame {event.readingNumber !== undefined ? `#${event.readingNumber}` : ''})
+            </span>
+            <span className="text-[10px] text-cyan-400/80">Hardware-reported protocol</span>
+          </div>
+        )}
+
         {/* Telemetry Metrics */}
         <div className="grid grid-cols-3 gap-2.5 my-4">
           <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800">
@@ -76,15 +86,21 @@ export const PotholeDetailModal: React.FC<PotholeDetailModalProps> = ({ event, o
           </div>
           <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800">
             <div className="text-[10px] text-slate-400 uppercase font-mono">Accel Z</div>
-            <div className="text-base font-bold font-mono text-slate-200 mt-0.5">{event.accelerationZ.toFixed(2)} m/s²</div>
+            <div className="text-sm font-bold font-mono text-slate-200 mt-0.5">
+              {event.source === 'HARDWARE' ? 'N/A (Firmware)' : `${event.accelerationZ.toFixed(2)} m/s²`}
+            </div>
           </div>
           <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800">
             <div className="text-[10px] text-slate-400 uppercase font-mono">Vibration</div>
-            <div className="text-base font-bold font-mono text-purple-400 mt-0.5">{event.vibrationLevel}/100</div>
+            <div className="text-base font-bold font-mono text-purple-400 mt-0.5">
+              {event.vibrationG !== undefined ? `${event.vibrationG.toFixed(1)} g` : `${event.vibrationLevel}/100`}
+            </div>
           </div>
           <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800">
             <div className="text-[10px] text-slate-400 uppercase font-mono">Speed</div>
-            <div className="text-base font-bold font-mono text-slate-200 mt-0.5">{event.vehicleSpeed} km/h</div>
+            <div className="text-sm font-bold font-mono text-slate-200 mt-0.5">
+              {event.source === 'HARDWARE' ? 'N/A' : `${event.vehicleSpeed} km/h`}
+            </div>
           </div>
         </div>
 
@@ -93,7 +109,11 @@ export const PotholeDetailModal: React.FC<PotholeDetailModalProps> = ({ event, o
           <div className="flex items-center gap-2">
             <MapPin className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
             <span className="text-slate-400">GPS:</span>
-            <span>{event.latitude.toFixed(5)}°, {event.longitude.toFixed(5)}°</span>
+            <span>
+              {event.source === 'HARDWARE' && (!event.latitude || event.latitude === 0)
+                ? 'Unavailable (No GPS module in firmware)'
+                : `${event.latitude.toFixed(5)}°, ${event.longitude.toFixed(5)}°`}
+            </span>
           </div>
           <div className="flex items-center gap-2">
             <Clock className="w-3.5 h-3.5 text-slate-400 shrink-0" />

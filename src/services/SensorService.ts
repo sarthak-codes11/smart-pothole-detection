@@ -45,12 +45,12 @@ export interface ISensorService {
   triggerScenario(scenario: 'normal' | 'rough' | 'small' | 'medium' | 'severe'): void;
 
   /**
-   * Get current latest reading synchronously.
+   * Get current latest reading synchronously, or null if no telemetry has been received.
    */
-  getCurrentReading(): SensorReading;
+  getCurrentReading(): SensorReading | null;
 
   /**
    * Source name identifier for UI status indicators.
    */
-  getSourceName(): 'SIMULATED' | 'ESP32_HARDWARE';
+  getSourceName(): 'DISCONNECTED' | 'SIMULATED' | 'ESP32_HARDWARE';
 }

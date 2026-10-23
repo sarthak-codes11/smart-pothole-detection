@@ -1,4 +1,4 @@
-import { SensorReading, DetectionResult, PotholeSeverity, PotholeEvent, PotholeStatus } from '../types';
+import { SensorReading, DetectionResult, PotholeSeverity, PotholeEvent, PotholeStatus, DetectionCondition } from '../types';
 import { DETECTION_CONFIG } from '../config/detectionConfig';
 
 export class DetectionEngine {
@@ -7,9 +7,9 @@ export class DetectionEngine {
   private accelZBuffer: number[] = [];
   private readonly bufferMaxSize: number = 10;
 
-  // Debouncing / Cooldown to avoid registering 5 duplicate events for 1 pothole
+  // Debouncing / Cooldown to avoid registering duplicate events for the same reading line
   private lastConfirmedPotholeTime: number = 0;
-  private readonly detectionCooldownMs: number = 2500;
+  private readonly detectionCooldownMs: number = 2400;
 
   /**
    * Reset rolling buffers
@@ -21,24 +21,73 @@ export class DetectionEngine {
   }
 
   /**
-   * Evaluate a sensor telemetry packet using multi-sensor fusion logic.
+   * Evaluate a sensor telemetry packet:
+   * 1. If reading comes from ESP32 hardware with authoritative statusText (NORMAL vs POTHOLE DETECTED),
+   *    we respect that status directly without overriding it.
+   * 2. Otherwise (simulation or raw sensor stream), we evaluate using the multi-sensor fusion matrix.
    */
   public evaluate(reading: SensorReading): {
     result: DetectionResult;
     newEvent: PotholeEvent | null;
   } {
-    // 1. Maintain Rolling History
+    // --- SPECIAL HANDLING: Authoritative ESP32 Firmware Status ---
+    if (reading.source === 'HARDWARE' && reading.statusText) {
+      const isPothole = reading.statusText === 'POTHOLE DETECTED';
+      const condition: DetectionCondition = isPothole ? 'POTHOLE DETECTED' : 'NORMAL';
+      const readingNumStr = reading.readingNumber != null ? `#${reading.readingNumber}` : '';
+
+      const reasons: string[] = isPothole
+        ? [
+            `Hardware Status: POTHOLE DETECTED (${reading.isPlayback ? 'ESP32 Playback ' + readingNumStr : 'Physical Sensor'})`,
+            `Reported Distance: ${reading.ultrasonicDistance.toFixed(1)} cm`,
+            `Reported Vibration: ${reading.vibrationG ?? reading.vibration} g`,
+          ]
+        : [
+            `Hardware Status: NORMAL (Normal Road ${readingNumStr})`,
+            `Reported Distance: ${reading.ultrasonicDistance.toFixed(1)} cm`,
+            `Reported Vibration: ${reading.vibrationG ?? reading.vibration} g`,
+          ];
+
+      const confidence = isPothole ? 95 : 0;
+      const severity: PotholeSeverity | null = isPothole
+        ? ((reading.vibrationG && reading.vibrationG >= 1.5) || reading.ultrasonicDistance >= 35 ? 'HIGH' : 'MEDIUM')
+        : null;
+
+      const result: DetectionResult = {
+        condition,
+        confidence,
+        severity,
+        reasons,
+        distanceAnomalyContribution: isPothole ? 40 : 0,
+        accelAnomalyContribution: isPothole ? 40 : 0,
+        vibrationContribution: isPothole ? 20 : 0,
+        isPotholeConfirmed: isPothole,
+      };
+
+      let newEvent: PotholeEvent | null = null;
+      const now = Date.now();
+      // Debounce duplicate events from same serial chunk
+      if (isPothole && (now - this.lastConfirmedPotholeTime > this.detectionCooldownMs)) {
+        this.lastConfirmedPotholeTime = now;
+        newEvent = this.buildPotholeEvent(reading, severity || 'MEDIUM', confidence, reasons);
+      }
+
+      return { result, newEvent };
+    }
+
+    // --- STANDARD MULTI-SENSOR FUSION EVALUATION (Simulation / Live Raw Stream) ---
     this.distanceBuffer.push(reading.ultrasonicDistance);
     if (this.distanceBuffer.length > this.bufferMaxSize) {
       this.distanceBuffer.shift();
     }
 
-    this.accelZBuffer.push(reading.acceleration.z);
+    const accelZVal = reading.acceleration?.z ?? DETECTION_CONFIG.baselines.accelZNominal;
+    this.accelZBuffer.push(accelZVal);
     if (this.accelZBuffer.length > this.bufferMaxSize) {
       this.accelZBuffer.shift();
     }
 
-    // Calculate rolling baselines (excluding the current instant value if buffer is long enough)
+    // Calculate rolling baselines
     const baselineDistance = this.distanceBuffer.length > 2
       ? this.distanceBuffer.slice(0, -1).reduce((a, b) => a + b, 0) / (this.distanceBuffer.length - 1)
       : DETECTION_CONFIG.baselines.ultrasonicDistanceCm;
@@ -68,16 +117,16 @@ export class DetectionEngine {
     distanceContribution = Math.min(40.0, Math.max(0, distanceContribution));
 
     // --- CONDITION B: Accelerometer Vertical Spike (40% Weight) ---
-    const accelDelta = Math.abs(reading.acceleration.z - baselineAccelZ);
+    const accelDelta = Math.abs(accelZVal - baselineAccelZ);
     let accelContribution = 0;
 
     if (accelDelta >= DETECTION_CONFIG.accelerationThresholds.severeSpikeDelta) {
       accelContribution = 40.0;
-      reasons.push(`Severe vertical acceleration shock spike (${reading.acceleration.z.toFixed(2)} m/s², Δ${accelDelta.toFixed(2)})`);
+      reasons.push(`Severe vertical acceleration shock spike (${accelZVal.toFixed(2)} m/s², Δ${accelDelta.toFixed(2)})`);
     } else if (accelDelta >= DETECTION_CONFIG.accelerationThresholds.mediumSpikeDelta) {
       const ratio = (accelDelta - DETECTION_CONFIG.accelerationThresholds.mediumSpikeDelta) / 3.0;
       accelContribution = 28.0 + (ratio * 10.0);
-      reasons.push(`Moderate vertical acceleration spike (${reading.acceleration.z.toFixed(2)} m/s²)`);
+      reasons.push(`Moderate vertical acceleration spike (${accelZVal.toFixed(2)} m/s²)`);
     } else if (accelDelta >= DETECTION_CONFIG.accelerationThresholds.minorSpikeDelta) {
       const ratio = (accelDelta - DETECTION_CONFIG.accelerationThresholds.minorSpikeDelta) / 3.0;
       accelContribution = 15.0 + (ratio * 12.0);
@@ -180,27 +229,39 @@ export class DetectionEngine {
     const impactLevel: 'Minor' | 'Moderate' | 'Severe' =
       severity === 'HIGH' ? 'Severe' : severity === 'MEDIUM' ? 'Moderate' : 'Minor';
 
-    // Find nearest named road segment
-    const nearestSegment = this.getNearestSegmentName(reading.gps.latitude, reading.gps.longitude);
+    const isSimulated = reading.source === 'SIMULATION';
+    const idPrefix = isSimulated ? 'SIM' : (reading.isPlayback ? 'HW-PB' : 'PTH');
+
+    const nearestSegment = isSimulated && reading.gps?.latitude && reading.gps?.longitude
+      ? this.getNearestSegmentName(reading.gps.latitude, reading.gps.longitude)
+      : (reading.isPlayback ? `ESP32 Playback Sample #${reading.readingNumber ?? ''}` : 'Physical Inspection Corridor');
 
     return {
-      id: `PTH-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`,
+      id: `${idPrefix}-${Date.now().toString().slice(-6)}-${Math.floor(100 + Math.random() * 900)}`,
       timestamp: reading.timestamp,
-      latitude: reading.gps.latitude,
-      longitude: reading.gps.longitude,
+      source: reading.source || 'HARDWARE',
+      isSimulated,
+      isPlayback: reading.isPlayback,
+      readingNumber: reading.readingNumber,
+      latitude: reading.gps?.latitude ?? 0,
+      longitude: reading.gps?.longitude ?? 0,
       severity,
       confidence,
       estimatedDepth: depthStr,
       impactLevel,
       ultrasonicDistance: reading.ultrasonicDistance,
-      accelerationX: reading.acceleration.x,
-      accelerationY: reading.acceleration.y,
-      accelerationZ: reading.acceleration.z,
+      accelerationX: reading.acceleration?.x ?? 0,
+      accelerationY: reading.acceleration?.y ?? 0,
+      accelerationZ: reading.acceleration?.z ?? 9.81,
       vibrationLevel: reading.vibration,
-      vehicleSpeed: reading.gps.speed,
+      vibrationG: reading.vibrationG,
+      vehicleSpeed: reading.gps?.speed ?? 0,
       status: 'NEW' as PotholeStatus,
-      reasons,
+      reasons: isSimulated ? ['[SIMULATION] ' + reasons[0], ...reasons.slice(1)] : reasons,
       roadSegmentName: nearestSegment,
+      notes: isSimulated
+        ? 'Simulated pothole candidate (Synthetic Demo Session)'
+        : (reading.isPlayback ? `Hardware-reported pothole detection (ESP32 recorded reading #${reading.readingNumber})` : 'Physical ESP32 hardware detection'),
     };
   }
 

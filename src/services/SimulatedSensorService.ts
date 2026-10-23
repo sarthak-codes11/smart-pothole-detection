@@ -68,6 +68,10 @@ export class SimulatedSensorService implements ISensorService {
       clearTimeout(this.timerId);
       this.timerId = null;
     }
+    if (this.activeSequenceTimeout !== null) {
+      clearTimeout(this.activeSequenceTimeout);
+      this.activeSequenceTimeout = null;
+    }
   }
 
   public reset(): void {
@@ -82,6 +86,8 @@ export class SimulatedSensorService implements ISensorService {
     this.currentLng = DETECTION_CONFIG.routeWaypoints[0].lng;
     this.currentSpeed = DETECTION_CONFIG.baselines.vehicleSpeedNominal;
     this.currentHeading = 42.0;
+    this.naturalPatrolTickCount = 0;
+    this.demoPotholeCount = 0;
     this.resetOffsets();
 
     this.updateSequenceState({
@@ -101,7 +107,7 @@ export class SimulatedSensorService implements ISensorService {
     return this.running;
   }
 
-  public getSourceName(): 'SIMULATED' | 'ESP32_HARDWARE' {
+  public getSourceName(): 'DISCONNECTED' | 'SIMULATED' | 'ESP32_HARDWARE' {
     return 'SIMULATED';
   }
 
@@ -120,18 +126,46 @@ export class SimulatedSensorService implements ISensorService {
     this.vibrationOffset = 0;
   }
 
+  private naturalPatrolTickCount: number = 0;
+  private demoPotholeCount: number = 0;
+  private sequenceCounter: number = 1;
+
   private tick = (): void => {
     if (!this.running) return;
 
     // Advance GPS along the realistic waypoints route
     this.advanceVehiclePosition();
 
+    // Natural patrol anomaly logic if no manual sequence is active:
+    // Produces a realistic variation and detects a pothole 1-2 times during the demo
+    if (!this.currentSequenceState.isActive) {
+      this.naturalPatrolTickCount++;
+
+      // Event 1: At ~7 seconds into demo (tick 10)
+      if (this.demoPotholeCount === 0 && this.naturalPatrolTickCount >= 10) {
+        this.demoPotholeCount++;
+        this.naturalPatrolTickCount = 0;
+        this.triggerScenario('medium');
+      }
+      // Event 2: At ~25 seconds later (tick 35)
+      else if (this.demoPotholeCount === 1 && this.naturalPatrolTickCount >= 35) {
+        this.demoPotholeCount++;
+        this.naturalPatrolTickCount = 0;
+        this.triggerScenario('medium');
+      }
+      // Subsequent runs: Sparse/rare (every ~120 ticks / 90 seconds) so vehicle cruises smoothly
+      else if (this.demoPotholeCount >= 2 && this.naturalPatrolTickCount >= 120) {
+        this.naturalPatrolTickCount = 0;
+        this.triggerScenario('medium');
+      }
+    }
+
     // Generate new sensor reading
     this.latestReading = this.generateReading();
     this.notifyListeners();
 
-    // Schedule next tick (between 350ms and 450ms for realistic hardware telemetry)
-    const interval = 350 + Math.floor(Math.random() * 100);
+    // Schedule next tick (between 650ms and 800ms for realistic, controlled hardware-like telemetry)
+    const interval = 650 + Math.floor(Math.random() * 150);
     this.timerId = window.setTimeout(this.tick, interval);
   };
 
@@ -167,13 +201,14 @@ export class SimulatedSensorService implements ISensorService {
   }
 
   private generateReading(): SensorReading {
-    // Add micro physical noise (sensor jitter)
-    const distJitter = (Math.random() * 0.8 - 0.4);
-    const accelZJitter = (Math.random() * 0.3 - 0.15);
-    const accelXJitter = (Math.random() * 0.2 - 0.1);
-    const accelYJitter = (Math.random() * 0.2 - 0.1);
-    const gyroJitter = (Math.random() * 0.4 - 0.2);
-    const vibJitter = (Math.random() * 3 - 1.5);
+    // Add micro physical noise (sensor jitter) with gentle realistic road texture variation
+    const wave = Math.sin(this.sequenceCounter * 0.2) * 0.9;
+    const distJitter = (Math.random() * 0.6 - 0.3) + wave;
+    const accelZJitter = (Math.random() * 0.24 - 0.12) + (wave * 0.15);
+    const accelXJitter = (Math.random() * 0.16 - 0.08);
+    const accelYJitter = (Math.random() * 0.16 - 0.08);
+    const gyroJitter = (Math.random() * 0.3 - 0.15);
+    const vibJitter = (Math.random() * 2.5 - 1.25) + (wave * 2.0);
 
     const base = DETECTION_CONFIG.baselines;
 
@@ -193,6 +228,8 @@ export class SimulatedSensorService implements ISensorService {
 
     return {
       timestamp: new Date().toISOString(),
+      source: 'SIMULATION',
+      sequenceNumber: this.sequenceCounter++,
       ultrasonicDistance,
       acceleration: { x: accelX, y: accelY, z: accelZ },
       gyroscope: { x: gyroX, y: gyroY, z: gyroZ },
@@ -203,6 +240,8 @@ export class SimulatedSensorService implements ISensorService {
         speed: Number(this.currentSpeed.toFixed(1)),
         heading: Number(this.currentHeading.toFixed(1)),
         isLocked: true,
+        satellites: 8,
+        isSimulated: true,
       },
     };
   }
@@ -319,7 +358,7 @@ export class SimulatedSensorService implements ISensorService {
           } else if (scenario === 'rough') {
             this.distanceOffset = 4.5;
           } else if (scenario === 'small') {
-            this.distanceOffset = 7.5; // ~28.5cm total
+            this.distanceOffset = 9.5; // ~30.5cm total
           } else if (scenario === 'medium') {
             this.distanceOffset = 14.0; // ~35.0cm total
           } else if (scenario === 'severe') {
@@ -341,9 +380,9 @@ export class SimulatedSensorService implements ISensorService {
             this.accelZOffset = 2.5;
             this.accelXOffset = 0.8;
           } else if (scenario === 'small') {
-            this.accelZOffset = 4.2;
-            this.accelXOffset = 1.2;
-            this.gyroYOffset = 3.5;
+            this.accelZOffset = 5.5;
+            this.accelXOffset = 1.6;
+            this.gyroYOffset = 4.2;
           } else if (scenario === 'medium') {
             this.accelZOffset = 7.8;
             this.accelXOffset = 2.5;
@@ -370,7 +409,7 @@ export class SimulatedSensorService implements ISensorService {
           } else if (scenario === 'rough') {
             this.vibrationOffset = 35; // total ~47
           } else if (scenario === 'small') {
-            this.vibrationOffset = 45; // total ~57
+            this.vibrationOffset = 52; // total ~64
           } else if (scenario === 'medium') {
             this.vibrationOffset = 65; // total ~77
           } else if (scenario === 'severe') {

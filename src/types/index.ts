@@ -6,32 +6,65 @@ export type RoadCondition = 'NORMAL' | 'WARNING' | 'CRITICAL';
 
 export type DetectionCondition = 'NORMAL' | 'POSSIBLE IRREGULARITY' | 'POTHOLE DETECTED';
 
+export type HardwareConnectionStatus =
+  | 'DISCONNECTED'
+  | 'CONNECTING'
+  | 'AWAITING_TELEMETRY'
+  | 'CONNECTED'
+  | 'CONNECTION_LOST'
+  | 'ERROR';
+
+export type HardwareConnectionType = 'WEBSOCKET' | 'SERIAL';
+
+export type TelemetrySource = 'HARDWARE' | 'SIMULATION';
+
+export type OperatingMode = 'STANDBY' | 'HARDWARE' | 'SIMULATION';
+
+export type AnalysisState = 'IDLE' | 'RUNNING' | 'PAUSED';
+
 export interface SensorReading {
   timestamp: string;
+  source: TelemetrySource;
+  isSimulated?: boolean;
+  isPlayback?: boolean;
+  sequenceNumber?: number;
+  readingNumber?: number;
   ultrasonicDistance: number; // in cm
+  vibrationG?: number; // vibration in g reported by firmware
+  vibration: number; // reported vibration value
+  statusText?: 'NORMAL' | 'POTHOLE DETECTED';
+  isPotholeDetected?: boolean;
   acceleration: {
-    x: number; // m/s^2
-    y: number; // m/s^2
-    z: number; // m/s^2 (nominal ~9.8)
+    x: number | null; // m/s^2 or null if unavailable
+    y: number | null;
+    z: number | null;
+    isAvailable?: boolean;
   };
   gyroscope: {
-    x: number; // deg/s
-    y: number; // deg/s
-    z: number; // deg/s
+    x: number | null;
+    y: number | null;
+    z: number | null;
+    isAvailable?: boolean;
   };
-  vibration: number; // 0 - 100 scale
   gps: {
-    latitude: number;
-    longitude: number;
-    speed: number; // km/h
-    heading: number; // degrees 0-360
+    latitude: number | null;
+    longitude: number | null;
+    speed: number | null;
+    heading: number | null;
     isLocked: boolean;
+    satellites?: number | null;
+    isSimulated?: boolean;
+    isAvailable?: boolean;
   };
 }
 
 export interface PotholeEvent {
   id: string;
   timestamp: string;
+  source: TelemetrySource;
+  isSimulated?: boolean;
+  isPlayback?: boolean;
+  readingNumber?: number;
   latitude: number;
   longitude: number;
   severity: PotholeSeverity;
@@ -43,6 +76,7 @@ export interface PotholeEvent {
   accelerationY: number;
   accelerationZ: number;
   vibrationLevel: number;
+  vibrationG?: number;
   vehicleSpeed: number;
   status: PotholeStatus;
   reasons: string[];
@@ -52,19 +86,19 @@ export interface PotholeEvent {
 }
 
 export interface DetectionResult {
-  condition: DetectionCondition;
-  confidence: number; // 0 - 100%
+  condition: DetectionCondition | 'STANDBY';
+  confidence: number | null; // 0 - 100% or null when awaiting telemetry
   severity: PotholeSeverity | null;
   reasons: string[];
-  distanceAnomalyContribution: number; // 0 - 40
-  accelAnomalyContribution: number; // 0 - 40
-  vibrationContribution: number; // 0 - 20
+  distanceAnomalyContribution: number | null; // 0 - 40 or null
+  accelAnomalyContribution: number | null; // 0 - 40 or null
+  vibrationContribution: number | null; // 0 - 20 or null
   isPotholeConfirmed: boolean;
 }
 
 export interface RoadHealthMetrics {
-  score: number; // 0 - 100
-  rating: 'GOOD' | 'MODERATE' | 'POOR';
+  score: number | null; // 0 - 100 or null when unavailable
+  rating: 'GOOD' | 'MODERATE' | 'POOR' | 'UNAVAILABLE';
   totalPotholes: number;
   highSeverityCount: number;
   mediumSeverityCount: number;
@@ -73,46 +107,53 @@ export interface RoadHealthMetrics {
   mostAffectedSegment: string;
   activePotholesCount: number;
   repairedCount: number;
+  isAvailable?: boolean;
 }
 
 export interface SubsystemStatus {
   esp32: {
-    hardwareStatus: 'NOT CONNECTED';
-    mode: 'SIMULATION';
-    name: 'ESP-32 Dual Core MCU';
+    hardwareStatus: 'NOT CONNECTED' | 'CONNECTED';
+    mode: 'STANDBY' | 'HARDWARE' | 'AWAITING INTEGRATION';
+    name: string;
+    details: string;
   };
   ultrasonic: {
-    name: 'HC-SR04 Ultrasonic Distance Sensor';
-    status: 'SIMULATED';
+    name: string;
+    status: 'NO DATA' | 'AWAITING TELEMETRY' | 'ACTIVE';
     currentRange: string;
     healthy: boolean;
   };
   mpu9250: {
-    name: 'MPU-9250 9-DoF IMU (Accel + Gyro)';
-    status: 'SIMULATED';
-    sampleRate: '50 Hz';
+    name: string;
+    status: 'NO DATA' | 'AWAITING TELEMETRY' | 'ACTIVE';
+    sampleRate: string;
     healthy: boolean;
   };
   gps: {
-    name: 'NEO-6M GPS Receiver Module';
-    status: 'SIMULATED';
-    satellites: number;
+    name: string;
+    status: 'NO FIX' | 'AWAITING TELEMETRY' | 'LOCKED';
+    satellites: number | null;
     healthy: boolean;
   };
   vibration: {
-    name: 'SW-420 Piezo Vibration Sensor';
-    status: 'SIMULATED';
+    name: string;
+    status: 'NO DATA' | 'AWAITING TELEMETRY' | 'ACTIVE';
     healthy: boolean;
   };
-  cloudDatabase: {
-    name: 'Telemetry & Event Storage';
+  buzzer: {
+    name: string;
+    status: 'INTEGRATION PENDING';
+    details: string;
+  };
+  storage: {
+    name: string;
     status: 'LOCAL STORAGE';
     recordCount: number;
   };
   detectionEngine: {
-    name: 'Rule-Based Multi-Sensor Fusion Engine';
-    status: 'ACTIVE';
-    algorithm: 'Weighted Anomaly Confidence Matrix';
+    name: string;
+    status: 'INITIALIZED (STANDBY)' | 'PROCESSING';
+    algorithm: string;
   };
 }
 
